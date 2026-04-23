@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gcpc-rigid-georef"
+version = "0.1.0"
+description = "Rigid georeferencing of a point cloud using Ground Control Point Clouds (GCPCs)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "laspy[lazrs]>=2.0",
+    "matplotlib>=3.8",
+    "numpy>=1.24",
+    "seaborn>=0.13",
+    "small-gicp>=1.0.0",
+    "scipy>=1.10",
+]
+
+[project.scripts]
+gcpc-rigid-georef = "gcpc.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gcpc"]

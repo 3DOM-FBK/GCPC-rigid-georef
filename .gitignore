@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / distribution
+dist/
+build/
+*.egg-info/
+
+# Tools
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Data and outputs (too large / generated)
+data/
+output/
+*.las
+*.laz
+PLAN.md
+
+# OS
+.DS_Store
+Thumbs.db

@@ -65,7 +65,15 @@ DEFAULT_NUM_THREADS = max(os.cpu_count() or 1, 1)
 )
 @click.option(
     "--save-georef-las", is_flag=True, default=False,
-    help="Write pc_georeferenced.las to the output directory.",
+    help="Write pc_georeferenced.las to the output directory (loads full point cloud into RAM).",
+)
+@click.option(
+    "--save-georef-las-opt", is_flag=True, default=False,
+    help=(
+        "Write pc_georeferenced.las using memory-efficient chunked streaming "
+        "(two passes over the file; preferred for large point clouds). "
+        "Takes precedence over --save-georef-las when both are set."
+    ),
 )
 def main(
     pc_path: Path,
@@ -78,6 +86,7 @@ def main(
     num_threads: int,
     min_fitness: float,
     save_georef_las: bool,
+    save_georef_las_opt: bool,
 ) -> None:
     """Georeference a point cloud using GNSS-enabled GCPCs."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -171,10 +180,12 @@ def main(
     click.echo(f"\nReport  ->  {report_path}")
     click.echo(f"Coverage heatmap  ->  {heatmap_path}")
 
-    if save_georef_las:
+    if save_georef_las or save_georef_las_opt:
         out_las = output_dir / "pc_georeferenced.las"
-        click.echo(f"Writing georeferenced point cloud  ->  {out_las}")
-        io.save_transformed_las(pc_path, avg.T_avg, out_las)
+        chunked = save_georef_las_opt  # opt flag takes precedence
+        mode_label = "chunked streaming" if chunked else "in-memory"
+        click.echo(f"Writing georeferenced point cloud ({mode_label})  ->  {out_las}")
+        io.save_transformed_las(pc_path, avg.T_avg, out_las, chunked=chunked)
 
     click.echo(
         f"\n3-D translation sigma (absolute) : {avg.sigma_t_abs_3d:.4f} m\n"

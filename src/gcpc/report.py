@@ -9,6 +9,32 @@ from .averaging import AveragingResult, PairLocalResidual
 from .registration import PairResult
 
 
+FINAL_TRANSLATION_DECIMALS = 9
+FINAL_ROTATION_DECIMALS = 9
+FINAL_MATRIX_DECIMALS = 12
+FINAL_QUATERNION_DECIMALS = 12
+RESIDUAL_DECIMALS = 6
+
+
+def _fmt_scalar(value: float, digits: int = 4) -> str:
+    """Format finite floats consistently and render missing values as n/a."""
+    if not np.isfinite(value):
+        return "n/a"
+    return f"{value:.{digits}f}"
+
+
+def _fmt_matrix_rows(matrix: np.ndarray, digits: int = 8) -> list[str]:
+    """Format a matrix for fenced-code rendering in the Markdown report."""
+    rows: list[str] = []
+    for row in matrix:
+        formatted = [
+            f"{value:12.{digits}f}" if np.isfinite(value) else f"{'n/a':>12}"
+            for value in row
+        ]
+        rows.append("  " + "  ".join(formatted))
+    return rows
+
+
 def build_report(
     pair_results: list[PairResult],
     avg: AveragingResult,
@@ -23,29 +49,25 @@ def build_report(
     t = avg.T_avg[:3, 3]
 
     matrix_lines = [
-        "  " + "  ".join(f"{v:12.6f}" for v in row)
+        "  " + "  ".join(f"{v:16.{FINAL_MATRIX_DECIMALS}f}" for v in row)
         for row in avg.T_avg
     ]
 
-    cov_t_lines = [
-        "  " + "  ".join(f"{v:12.8f}" for v in row)
-        for row in avg.cov_t
-    ]
-    cov_t_abs_lines = [
-        "  " + "  ".join(f"{v:12.8f}" for v in row)
-        for row in avg.cov_t_abs
-    ]
+    cov_t_lines = _fmt_matrix_rows(avg.cov_t)
     deg2_per_rad2 = (180.0 / np.pi) ** 2
-    cov_r_lines = [
-        "  " + "  ".join(f"{v * deg2_per_rad2:12.8f}" for v in row)
-        for row in avg.cov_r
-    ]
+    cov_r_lines = _fmt_matrix_rows(avg.cov_r * deg2_per_rad2)
+    posterior_note = None
+    if len(pair_results) == 1:
+        posterior_note = (
+            "Posterior consistency from transform scatter is unavailable with a single "
+            "accepted GCPC."
+        )
 
     if local_residuals is None:
         residual_rows = [
             f"| {r.name:>4} | {r.fitness:.3f} | {r.inlier_rmse:.4f} "
-            f"| {avg.t_residuals[i][0]:+.4f} | {avg.t_residuals[i][1]:+.4f} "
-            f"| {avg.t_residuals[i][2]:+.4f} | {avg.r_residuals[i]:.4f} |"
+            f"| {avg.t_residuals[i][0]:+.{RESIDUAL_DECIMALS}f} | {avg.t_residuals[i][1]:+.{RESIDUAL_DECIMALS}f} "
+            f"| {avg.t_residuals[i][2]:+.{RESIDUAL_DECIMALS}f} | {avg.r_residuals[i]:.{RESIDUAL_DECIMALS}f} |"
             for i, r in enumerate(pair_results)
         ]
         residual_heading = "## Per-GCPC Residuals"
@@ -54,8 +76,8 @@ def build_report(
     else:
         residual_rows = [
             f"| {pair.name:>4} | {pair.fitness:.3f} | {pair.inlier_rmse:.4f} "
-            f"| {local.translation[0]:+.4f} | {local.translation[1]:+.4f} | {local.translation[2]:+.4f} "
-            f"| {local.rotation_vec_deg[0]:+.4f} | {local.rotation_vec_deg[1]:+.4f} | {local.rotation_vec_deg[2]:+.4f} |"
+            f"| {local.translation[0]:+.{RESIDUAL_DECIMALS}f} | {local.translation[1]:+.{RESIDUAL_DECIMALS}f} | {local.translation[2]:+.{RESIDUAL_DECIMALS}f} "
+            f"| {local.rotation_vec_deg[0]:+.{RESIDUAL_DECIMALS}f} | {local.rotation_vec_deg[1]:+.{RESIDUAL_DECIMALS}f} | {local.rotation_vec_deg[2]:+.{RESIDUAL_DECIMALS}f} |"
             for pair, local in zip(pair_results, local_residuals)
         ]
         residual_heading = "## Per-GCPC Relative Transform Residuals"
@@ -75,13 +97,13 @@ def build_report(
         "",
         "| Parameter | Value |",
         "|-----------|-------|",
-        f"| T_X (m) | {t[0]:.4f} |",
-        f"| T_Y (m) | {t[1]:.4f} |",
-        f"| T_Z (m) | {t[2]:.4f} |",
-        f"| 𝜙 (deg) | {euler[0]:.6f} |",
-        f"| 𝜃 (deg) | {euler[1]:.6f} |",
-        f"| 𝜓 (deg) | {euler[2]:.6f} |",
-        f"| Quaternion_xyzw | `{quat[0]:.6f}  {quat[1]:.6f}  {quat[2]:.6f}  {quat[3]:.6f}` |",
+        f"| T_X (m) | {t[0]:.{FINAL_TRANSLATION_DECIMALS}f} |",
+        f"| T_Y (m) | {t[1]:.{FINAL_TRANSLATION_DECIMALS}f} |",
+        f"| T_Z (m) | {t[2]:.{FINAL_TRANSLATION_DECIMALS}f} |",
+        f"| 𝜙 (deg) | {euler[0]:.{FINAL_ROTATION_DECIMALS}f} |",
+        f"| 𝜃 (deg) | {euler[1]:.{FINAL_ROTATION_DECIMALS}f} |",
+        f"| 𝜓 (deg) | {euler[2]:.{FINAL_ROTATION_DECIMALS}f} |",
+        f"| Quaternion_xyzw | `{quat[0]:.{FINAL_QUATERNION_DECIMALS}f}  {quat[1]:.{FINAL_QUATERNION_DECIMALS}f}  {quat[2]:.{FINAL_QUATERNION_DECIMALS}f}  {quat[3]:.{FINAL_QUATERNION_DECIMALS}f}` |",
         "",
         "**4 x 4 Transformation Matrix:**",
         "",
@@ -105,23 +127,24 @@ def build_report(
         "",
         "| Component | Value |",
         "|-----------|-------|",
-        f"| σ_X (m) | {avg.sigma_t_abs[0]:.4f} |",
-        f"| σ_Y (m) | {avg.sigma_t_abs[1]:.4f} |",
-        f"| σ_Z (m) | {avg.sigma_t_abs[2]:.4f} |",
-        f"| σ_3D(m) | {avg.sigma_t_abs_3d:.4f} |",
+        f"| σ_X (m) | {_fmt_scalar(avg.sigma_t_abs[0])} |",
+        f"| σ_Y (m) | {_fmt_scalar(avg.sigma_t_abs[1])} |",
+        f"| σ_Z (m) | {_fmt_scalar(avg.sigma_t_abs[2])} |",
+        f"| σ_3D(m) | {_fmt_scalar(avg.sigma_t_abs_3d)} |",
         "",
         "### Posterior Consistency From GCPC Single Transformation Result Scatter",
         "",
+        *([posterior_note, ""] if posterior_note is not None else []),
         "| Component | Value |",
         "|-----------|-------|",
-        f"| σ_X (m) | {avg.sigma_t[0]:.4f} |",
-        f"| σ_Y (m) | {avg.sigma_t[1]:.4f} |",
-        f"| σ_Z (m) | {avg.sigma_t[2]:.4f} |",
-        f"| σ_3D(m) | {avg.sigma_t_3d:.4f} |",
-        f"| σ_𝜙 (deg) | {avg.sigma_r_vec[0]:.4f} |",
-        f"| σ_𝜃 (deg) | {avg.sigma_r_vec[1]:.4f} |",
-        f"| σ_𝜓 (deg) | {avg.sigma_r_vec[2]:.4f} |",
-        f"| σ_rot (deg) | {avg.sigma_r:.4f} |",
+        f"| σ_X (m) | {_fmt_scalar(avg.sigma_t[0])} |",
+        f"| σ_Y (m) | {_fmt_scalar(avg.sigma_t[1])} |",
+        f"| σ_Z (m) | {_fmt_scalar(avg.sigma_t[2])} |",
+        f"| σ_3D(m) | {_fmt_scalar(avg.sigma_t_3d)} |",
+        f"| σ_𝜙 (deg) | {_fmt_scalar(avg.sigma_r_vec[0])} |",
+        f"| σ_𝜃 (deg) | {_fmt_scalar(avg.sigma_r_vec[1])} |",
+        f"| σ_𝜓 (deg) | {_fmt_scalar(avg.sigma_r_vec[2])} |",
+        f"| σ_rot (deg) | {_fmt_scalar(avg.sigma_r)} |",
         "",
         "**Translation covariance matrix from posterior transform scatter (m^2):**",
         "",

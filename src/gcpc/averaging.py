@@ -39,8 +39,8 @@ class AveragingResult:
 @dataclass
 class PairLocalResidual:
     name: str
-    translation: np.ndarray       # (3,) relative translation vector in final world frame (m)
-    rotation_vec_deg: np.ndarray  # (3,) relative rotation vector in final world frame (deg)
+    translation: np.ndarray       # (3,) anchor-point residual in final world frame (m)
+    rotation_vec_deg: np.ndarray  # (3,) relative rotation vector final <- single (deg)
 
 
 def _weighted_quaternion_seed(rotations: list[Rotation], weights: np.ndarray) -> Rotation:
@@ -112,6 +112,26 @@ def _translation_covariance_from_absolute_sigmas(sigmas: np.ndarray) -> np.ndarr
     return np.eye(3, dtype=np.float64) / weights.sum()
 
 
+def _solve_translation_mean(
+    anchors_pc: np.ndarray,
+    anchors_global: np.ndarray,
+    rotation_matrix: np.ndarray,
+    weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Solve the weighted translation LS after fixing the mean rotation.
+
+    Each pair contributes one translation observation implied at its own anchor:
+
+        t_i = anchor_global_i - R_avg @ anchor_pc_i
+
+    The final translation is the weighted LS mean of these observations.
+    """
+    translation_observations = anchors_global - anchors_pc @ rotation_matrix.T
+    translation_mean = np.average(translation_observations, axis=0, weights=weights)
+    residuals = translation_observations - translation_mean
+    return translation_mean, residuals
+
+
 def centered_transform_from_global(T_global: np.ndarray, center: np.ndarray) -> np.ndarray:
     """Recover the centred-frame point-cloud->global transform from the global-frame one."""
     T_centered = np.eye(4)
@@ -120,34 +140,66 @@ def centered_transform_from_global(T_global: np.ndarray, center: np.ndarray) -> 
     return T_centered
 
 
+def global_transform_from_centered(T_centered: np.ndarray, center: np.ndarray) -> np.ndarray:
+    """Compose the global-frame point-cloud->global transform from the centred-frame one."""
+    T_global = np.eye(4)
+    T_global[:3, :3] = T_centered[:3, :3]
+    T_global[:3, 3] = center - T_centered[:3, :3] @ center + T_centered[:3, 3]
+    return T_global
+
+
+def single_transform(result: PairResult, center: np.ndarray) -> AveragingResult:
+    """Return a direct point-cloud->global solution from a single accepted GCPC."""
+    rmse = float(result.inlier_rmse)
+    sigma_t_abs = np.full(3, rmse, dtype=np.float64)
+    nan_vec = np.full(3, np.nan, dtype=np.float64)
+    nan_mat = np.full((3, 3), np.nan, dtype=np.float64)
+
+    return AveragingResult(
+        T_avg=global_transform_from_centered(result.T_centered, center),
+        t_residuals=np.zeros((1, 3), dtype=np.float64),
+        r_residuals=np.zeros(1, dtype=np.float64),
+        weights=np.ones(1, dtype=np.float64),
+        sigma_t_abs=sigma_t_abs,
+        sigma_t_abs_3d=float(np.sqrt(3.0) * rmse),
+        sigma_t=nan_vec.copy(),
+        sigma_t_3d=float("nan"),
+        sigma_r_vec=nan_vec.copy(),
+        sigma_r=float("nan"),
+        t_rmse=0.0,
+        cov_t_abs=np.eye(3, dtype=np.float64) * rmse**2,
+        cov_t=nan_mat.copy(),
+        cov_r=nan_mat.copy(),
+    )
+
+
 def compute_pair_local_residuals(
     results: list[PairResult],
     avg: AveragingResult,
     center: np.ndarray,
 ) -> list[PairLocalResidual]:
-    """Compute per-GCPC transform residuals in the final averaged world frame.
+    """Compute per-GCPC local residuals at each GCPC anchor.
 
-    For each accepted GCPC, this returns the residual rigid transform from the
-    single-registration world frame to the final averaged world frame:
+    For each accepted GCPC, translation is evaluated at the GCPC anchor implied
+    by that single-registration result, not at the centred origin. This avoids
+    reporting lever-arm artefacts from small rotation differences.
 
-        T_residual_i = T_final_world <- T_single_world
-
-    Residuals are reported as one translation vector and one rotation vector.
+    Rotation residuals remain the relative final <- single rotation vector.
     """
     T_avg_c = centered_transform_from_global(avg.T_avg, center)
+    R_avg = Rotation.from_matrix(T_avg_c[:3, :3])
     diagnostics: list[PairLocalResidual] = []
 
     for result in results:
-        T_single_c = np.linalg.inv(result.T_centered)  # pc_centered -> global_centered from one GCPC
-        T_single_to_final = T_avg_c @ np.linalg.inv(T_single_c)
+        anchor_residual = result.anchor_pc @ T_avg_c[:3, :3].T + T_avg_c[:3, 3] - result.anchor_global
         rotation_vec_deg = np.degrees(
-            Rotation.from_matrix(T_single_to_final[:3, :3]).as_rotvec()
+            (R_avg * Rotation.from_matrix(result.T_centered[:3, :3]).inv()).as_rotvec()
         )
 
         diagnostics.append(
             PairLocalResidual(
                 name=result.name,
-                translation=T_single_to_final[:3, 3].astype(np.float64),
+                translation=anchor_residual.astype(np.float64),
                 rotation_vec_deg=rotation_vec_deg.astype(np.float64),
             )
         )
@@ -156,52 +208,51 @@ def compute_pair_local_residuals(
 
 
 def average_transforms(results: list[PairResult], center: np.ndarray) -> AveragingResult:
-    """Weighted average of rigid transforms in the centred frame.
+    """Weighted LS solution with rotation averaging and anchor-coupled translation.
 
-    Weight per pair:  w_i = 1 / inlier_rmse_i²
-    GICP RMSE is treated as the relative observation standard deviation, so the
-    transform mean is solved with inverse-variance weighting.
+    When a single accepted GCPC is available, return its transform directly.
 
-    Each GICP result T_centered_i maps GCPC_centred -> pc_centred.
-    Inverting gives T_pc_c_i: pc_centred -> GCPC_centred (≡ global_centred).
-    These centred transforms are averaged; the global-frame point-cloud->global
-    is constructed once from the mean.
+    Rotation is solved first by weighted least squares on SO(3) using the
+    individual pair rotations. Translation is then solved in a coupled way at
+    the GCPC anchors using that final rotation:
 
-    The final georeferencing uncertainty is derived from least-squares error
-    propagation in the centred frame:
+        t_i = anchor_global_i - R_avg @ anchor_pc_i
 
-    - translation covariance from the repeated-observation WLS mean
-    - rotation covariance from the local tangent-space WLS mean on SO(3)
+    so small rotation differences are converted into translation observations at
+    the actual GCPC locations rather than at the arbitrary centred origin.
     """
+    if len(results) == 1:
+        return single_transform(results[0], center)
+
     weights = np.array([1.0 / r.inlier_rmse**2 for r in results], dtype=np.float64)
     weights_norm = weights / weights.sum()
 
-    # Work with inv(T_centered): pc_centred -> global_centred
-    T_pc_c = [np.linalg.inv(r.T_centered) for r in results]
-    rotations = [Rotation.from_matrix(T[:3, :3]) for T in T_pc_c]
-    translations = np.array([T[:3, 3] for T in T_pc_c])  # small, centred-frame (m)
+    anchors_pc = np.array([r.anchor_pc for r in results], dtype=np.float64)
+    anchors_global = np.array([r.anchor_global for r in results], dtype=np.float64)
+    rotations = [Rotation.from_matrix(r.T_centered[:3, :3]) for r in results]
 
     R_avg, r_residual_vecs = _solve_rotation_mean(rotations, weights)
-    t_avg_c = np.average(translations, axis=0, weights=weights)
+    R_avg_matrix = R_avg.as_matrix()
+    t_avg_c, t_residuals = _solve_translation_mean(
+        anchors_pc,
+        anchors_global,
+        R_avg_matrix,
+        weights,
+    )
 
-    # Compose global-frame point-cloud -> global transform:
-    #   p_global = R_avg @ (p_pc – centre) + t_avg_c + centre
-    T_avg = np.eye(4)
-    T_avg[:3, :3] = R_avg.as_matrix()
-    T_avg[:3, 3] = center - R_avg.as_matrix() @ center + t_avg_c
+    T_avg_c = np.eye(4)
+    T_avg_c[:3, :3] = R_avg_matrix
+    T_avg_c[:3, 3] = t_avg_c
+    T_avg = global_transform_from_centered(T_avg_c, center)
 
-    # --- residuals in centred frame ---
-    t_residuals = translations - t_avg_c
     r_residuals = np.degrees(np.linalg.norm(r_residual_vecs, axis=1))
 
-    # --- uncertainty from absolute RMSE propagation ---
     cov_t_abs = _translation_covariance_from_absolute_sigmas(
         np.array([r.inlier_rmse for r in results], dtype=np.float64)
     )
     sigma_t_abs = np.sqrt(np.diag(cov_t_abs))
     sigma_t_abs_3d = float(np.sqrt(np.trace(cov_t_abs)))
 
-    # --- posterior consistency uncertainty from transform scatter ---
     cov_t = _covariance_from_weighted_ls(t_residuals, weights)
     cov_r = _covariance_from_weighted_ls(r_residual_vecs, weights)
 

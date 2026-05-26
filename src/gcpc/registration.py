@@ -1,10 +1,11 @@
-"""Pairwise GCPC -> point-cloud registration using small_gicp."""
+"""Pairwise point-cloud -> GCPC registration using small_gicp."""
 
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import small_gicp
+from scipy.spatial import cKDTree
 
 from . import io
 
@@ -27,7 +28,9 @@ class PairResult:
     """Outcome of a single GCPC-point-cloud registration."""
 
     name: str                 # GCPC stem, e.g. "3"
-    T_centered: np.ndarray    # (4, 4) result: maps GCPC_centered -> pc_centered
+    T_centered: np.ndarray    # (4, 4) result: maps pc_centered -> GCPC_centered
+    anchor_pc: np.ndarray     # (3,) anchor point in pc_centered coordinates
+    anchor_global: np.ndarray # (3,) corresponding anchor point in GCPC/global_centered coordinates
     fitness: float            # inlier fraction  [0, 1]
     inlier_rmse: float        # inlier RMSE  (m)
 
@@ -45,6 +48,30 @@ def _build_voxel_map(
     voxel_map = small_gicp.GaussianVoxelMap(voxel_size)
     voxel_map.insert(point_cloud)
     return voxel_map
+
+
+def _transform_xyz(xyz: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Apply a rigid transform to an (N, 3) XYZ array."""
+    return xyz @ transform[:3, :3].T + transform[:3, 3]
+
+
+def _crop_source_xyz_to_target_distance(
+    source_xyz: np.ndarray,
+    target_xyz_in_source_frame: np.ndarray,
+    max_distance: float,
+    num_threads: int,
+) -> np.ndarray:
+    """Return source points within max_distance of the target points."""
+    bounds_min = target_xyz_in_source_frame.min(axis=0) - max_distance
+    bounds_max = target_xyz_in_source_frame.max(axis=0) + max_distance
+    bbox_mask = np.all((source_xyz >= bounds_min) & (source_xyz <= bounds_max), axis=1)
+    bbox_source_xyz = source_xyz[bbox_mask]
+    if len(bbox_source_xyz) == 0:
+        return bbox_source_xyz
+
+    target_tree = cKDTree(target_xyz_in_source_frame)
+    distances, _ = target_tree.query(bbox_source_xyz, workers=num_threads)
+    return bbox_source_xyz[distances <= max_distance]
 
 
 def preprocess(
@@ -119,13 +146,30 @@ def _compute_registration_metrics(
     target: PreparedPointCloud,
     inlier_max_distance: float,
     num_threads: int,
+    reference: str = "source",
 ) -> tuple[float, float]:
-    """Compute inlier fraction and RMSE from the target KD-tree."""
-    source_xyz = _as_xyz_array(source.point_cloud)
-    transformed = source_xyz @ transform[:3, :3].T + transform[:3, 3]
+    """Compute inlier fraction and RMSE using either source or target coverage.
 
-    indices, sq_dists = target.kdtree.batch_nearest_neighbor_search(
-        transformed,
+    When registration is performed as source -> target, a small target and a much
+    larger source should be scored against the target coverage rather than the
+    full source size.
+    """
+    if reference == "source":
+        query_xyz = _as_xyz_array(source.point_cloud)
+        query_xyz = query_xyz @ transform[:3, :3].T + transform[:3, 3]
+        search_cloud = target
+        reference_count = source.num_points
+    elif reference == "target":
+        inverse_transform = np.linalg.inv(transform)
+        query_xyz = _as_xyz_array(target.point_cloud)
+        query_xyz = query_xyz @ inverse_transform[:3, :3].T + inverse_transform[:3, 3]
+        search_cloud = source
+        reference_count = target.num_points
+    else:
+        raise ValueError(f"Unsupported metric reference: {reference}")
+
+    indices, sq_dists = search_cloud.kdtree.batch_nearest_neighbor_search(
+        query_xyz,
         num_threads=num_threads,
     )
     indices = np.asarray(indices, dtype=np.int64)
@@ -133,17 +177,17 @@ def _compute_registration_metrics(
     inlier_mask = (indices >= 0) & (sq_dists <= inlier_max_distance**2)
     inlier_count = int(np.count_nonzero(inlier_mask))
 
-    if source.num_points == 0 or inlier_count == 0:
+    if reference_count == 0 or inlier_count == 0:
         return 0.0, np.inf
 
-    fitness = inlier_count / source.num_points
+    fitness = inlier_count / reference_count
     inlier_rmse = float(np.sqrt(np.mean(sq_dists[inlier_mask])))
     return fitness, max(inlier_rmse, 1e-9)
 
 
 def register_pair(
     gcpc_path: Path,
-    pc_target: PreparedPointCloud,
+    pc_reference: PreparedPointCloud,
     voxel_size: float = 0.10,
     max_distance: float = 2.0,
     inlier_max_distance: float = 0.20,
@@ -151,17 +195,26 @@ def register_pair(
     registration_method: str = "GICP",
     num_threads: int = 1,
 ) -> PairResult:
-    """Register one GCPC against the preprocessed point-cloud target.
+    """Register the preprocessed point cloud against one GCPC target.
 
     Both clouds must be in the same optionally centered frame. The returned
-    transform maps GCPC_centered -> pc_centered.
+    transform maps pc_centered -> GCPC_centered.
     """
     method = registration_method.upper()
     if method not in SUPPORTED_REGISTRATION_METHODS:
         raise ValueError(f"Unsupported registration method: {registration_method}")
 
     gcpc_xyz = io.load_xyz(gcpc_path)
-    gcpc_source = preprocess(gcpc_xyz, voxel_size, center, num_threads)
+    if center is not None:
+        gcpc_xyz = gcpc_xyz - center
+
+    gcpc_target = preprocess(
+        gcpc_xyz,
+        voxel_size,
+        center=None,
+        num_threads=num_threads,
+        build_voxel_map=(method == "VGICP"),
+    )
 
     align_kwargs = {
         "init_T_target_source": np.eye(4),
@@ -172,33 +225,84 @@ def register_pair(
     }
 
     if method == "VGICP":
-        if pc_target.voxel_map is None:
-            raise ValueError("VGICP requires a precomputed target voxel map")
-        result = small_gicp.align(
-            pc_target.voxel_map,
-            gcpc_source.point_cloud,
+        if pc_reference.voxel_map is None:
+            raise ValueError("VGICP requires a precomputed TLS voxel map")
+        coarse_result = small_gicp.align(
+            pc_reference.voxel_map,
+            gcpc_target.point_cloud,
             **align_kwargs,
         )
     else:
-        result = small_gicp.align(
-            pc_target.point_cloud,
-            gcpc_source.point_cloud,
-            target_tree=pc_target.kdtree,
+        coarse_result = small_gicp.align(
+            pc_reference.point_cloud,
+            gcpc_target.point_cloud,
+            target_tree=pc_reference.kdtree,
             registration_type=method,
             **align_kwargs,
+        )
+    coarse_transform = np.asarray(coarse_result.T_target_source, dtype=np.float64)
+
+    cropped_source_xyz = _crop_source_xyz_to_target_distance(
+        _as_xyz_array(pc_reference.point_cloud),
+        _transform_xyz(_as_xyz_array(gcpc_target.point_cloud), coarse_transform),
+        max_distance,
+        num_threads,
+    )
+    if len(cropped_source_xyz) == 0:
+        return PairResult(
+            name=gcpc_path.stem,
+            T_centered=np.eye(4, dtype=np.float64),
+            anchor_pc=np.zeros(3, dtype=np.float64),
+            anchor_global=np.zeros(3, dtype=np.float64),
+            fitness=0.0,
+            inlier_rmse=np.inf,
+        )
+
+    local_pc_source = preprocess(
+        cropped_source_xyz,
+        voxel_size,
+        center=None,
+        num_threads=num_threads,
+    )
+
+    fine_align_kwargs = dict(align_kwargs)
+    fine_align_kwargs["init_T_target_source"] = np.linalg.inv(coarse_transform)
+
+    if method == "VGICP":
+        if gcpc_target.voxel_map is None:
+            raise ValueError("VGICP requires a precomputed target voxel map")
+        result = small_gicp.align(
+            gcpc_target.voxel_map,
+            local_pc_source.point_cloud,
+            **fine_align_kwargs,
+        )
+    else:
+        result = small_gicp.align(
+            gcpc_target.point_cloud,
+            local_pc_source.point_cloud,
+            target_tree=gcpc_target.kdtree,
+            registration_type=method,
+            **fine_align_kwargs,
         )
 
     fitness, inlier_rmse = _compute_registration_metrics(
         np.asarray(result.T_target_source, dtype=np.float64),
-        gcpc_source,
-        pc_target,
+        local_pc_source,
+        gcpc_target,
         inlier_max_distance,
         num_threads,
+        reference="target",
     )
+
+    T_centered = np.asarray(result.T_target_source, dtype=np.float64)
+    gcpc_anchor = _as_xyz_array(gcpc_target.point_cloud).mean(axis=0).astype(np.float64)
+    anchor_pc = (gcpc_anchor - T_centered[:3, 3]) @ T_centered[:3, :3]
 
     return PairResult(
         name=gcpc_path.stem,
-        T_centered=np.asarray(result.T_target_source, dtype=np.float64),
+        T_centered=T_centered,
+        anchor_pc=anchor_pc.astype(np.float64),
+        anchor_global=gcpc_anchor,
         fitness=float(fitness),
         inlier_rmse=float(inlier_rmse),
     )

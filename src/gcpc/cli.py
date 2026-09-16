@@ -112,6 +112,22 @@ def _print_pair_transform(result: registration.PairResult, center: np.ndarray, a
     help="Minimum GICP fitness score to accept a GCPC pair [0–1].",
 )
 @click.option(
+    "--max-inlier-rmse", default=0.20, show_default=True, type=float,
+    help="Maximum inlier RMSE for an accepted GCPC pair (m).",
+)
+@click.option(
+    "--rmse-weight-floor", default=0.02, show_default=True, type=float,
+    help="Lower bound on RMSE used by inverse-variance-style fusion weights (m).",
+)
+@click.option(
+    "--max-anchor-residual", default=0.20, show_default=True, type=float,
+    help="Hard global-consensus cutoff at each GCPC anchor (m).",
+)
+@click.option(
+    "--max-rotation-residual", default=1.0, show_default=True, type=float,
+    help="Hard global-consensus cutoff between pair rotations (deg).",
+)
+@click.option(
     "--save-georef-las", is_flag=True, default=False,
     help="Write pc_georeferenced.las to the output directory (loads full point cloud into RAM).",
 )
@@ -139,6 +155,10 @@ def main(
     registration_method: str,
     num_threads: int,
     min_fitness: float,
+    max_inlier_rmse: float,
+    rmse_weight_floor: float,
+    max_anchor_residual: float,
+    max_rotation_residual: float,
     save_georef_las: bool,
     save_georef_las_opt: bool,
     verbose: bool,
@@ -155,6 +175,14 @@ def main(
         raise click.BadParameter("--num-threads must be >= 1")
     if inlier_max_distance <= 0:
         raise click.BadParameter("--inlier-max-distance must be > 0")
+    if max_inlier_rmse <= 0:
+        raise click.BadParameter("--max-inlier-rmse must be > 0")
+    if rmse_weight_floor <= 0:
+        raise click.BadParameter("--rmse-weight-floor must be > 0")
+    if max_anchor_residual <= 0:
+        raise click.BadParameter("--max-anchor-residual must be > 0")
+    if max_rotation_residual <= 0:
+        raise click.BadParameter("--max-rotation-residual must be > 0")
 
     # Preprocess the point cloud once and reuse its search structures across all GCPCs.
     click.echo(f"Loading point cloud: {pc_path}")
@@ -188,7 +216,7 @@ def main(
                 registration_method=method,
                 num_threads=num_threads,
             )
-            if r.fitness >= min_fitness:
+            if r.fitness >= min_fitness and r.inlier_rmse <= max_inlier_rmse:
                 accepted.append(r)
                 accepted_paths.append(gcpc_file)
                 processed_pairs.append((r, True))
@@ -198,7 +226,7 @@ def main(
 
     click.echo(
         f"\n  {len(accepted)} accepted  |  {len(rejected)} rejected "
-        f"(fitness < {min_fitness})"
+        f"(fitness < {min_fitness} or RMSE > {max_inlier_rmse:.3f} m)"
     )
     for r in rejected:
         click.echo(f"    [rejected] {r.name}  fitness={r.fitness:.3f}  rmse={r.inlier_rmse:.4f} m")
@@ -215,12 +243,70 @@ def main(
     if len(accepted) == 1:
         click.echo("  single accepted GCPC -> using its transform directly (no averaging)")
 
-    avg = averaging.average_transforms(accepted, center)
+    candidate_count = len(accepted)
+    consensus_rejections: list[averaging.ConsensusRejection] = []
+    consensus_ambiguous = False
+    consensus_rejected_paths: list[Path] = []
+    if candidate_count >= 2:
+        path_by_result = {id(result): path for result, path in zip(accepted, accepted_paths)}
+        accepted, consensus_rejections, consensus_ambiguous = averaging.reject_consensus_outliers(
+            accepted,
+            center,
+            max_anchor_residual,
+            max_rotation_residual,
+            rmse_weight_floor,
+        )
+        if len(accepted) < 2:
+            raise click.ClickException(
+                "Global GCPC consensus has fewer than two mutually compatible pairs."
+            )
+        accepted_paths = [path_by_result[id(result)] for result in accepted]
+        consensus_rejected_paths = [
+            path_by_result[id(item.result)] for item in consensus_rejections
+        ]
+        for item in consensus_rejections:
+            click.echo(
+                f"    [consensus outlier] {item.result.name}  {item.reason}; "
+                f"anchor={item.anchor_residual:.3f} m, rotation={item.rotation_residual:.3f} deg"
+            )
+        if consensus_ambiguous:
+            click.echo("    warning: multiple equal-size GCPC consensus groups were found")
+
+    avg = averaging.average_transforms(
+        accepted,
+        center,
+        rmse_weight_floor=rmse_weight_floor,
+    )
     local_residuals = averaging.compute_pair_local_residuals(
         accepted,
         avg,
         center,
     )
+    final_centered_transform = averaging.centered_transform_from_global(avg.T_avg, center)
+    final_fit_metrics = [
+        registration.evaluate_transform_against_gcpc(
+            path,
+            pc_source,
+            final_centered_transform,
+            voxel_size,
+            inlier_max_distance,
+            center,
+            num_threads,
+        )
+        for path in accepted_paths
+    ]
+    excluded_final_fit_metrics = [
+        registration.evaluate_transform_against_gcpc(
+            path,
+            pc_source,
+            final_centered_transform,
+            voxel_size,
+            inlier_max_distance,
+            center,
+            num_threads,
+        )
+        for path in consensus_rejected_paths
+    ]
 
     heatmap_path = output_dir / "gcpc_coverage_heatmap.png"
     plotting.save_gcpc_coverage_heatmap(
@@ -239,6 +325,14 @@ def main(
             n_rejected=len(rejected),
             coverage_plot_name=heatmap_path.name,
             local_residuals=local_residuals,
+            final_fit_metrics=final_fit_metrics,
+            consensus_rejections=consensus_rejections,
+            consensus_ambiguous=consensus_ambiguous,
+            rejected_pair_results=rejected,
+            excluded_final_fit_metrics=excluded_final_fit_metrics,
+            inlier_max_distance=inlier_max_distance,
+            max_anchor_residual=max_anchor_residual,
+            max_rotation_residual=max_rotation_residual,
         ),
         encoding="utf-8",
     )
@@ -253,8 +347,8 @@ def main(
         io.save_transformed_las(pc_path, avg.T_avg, out_las, chunked=chunked)
 
     click.echo(
-        f"\n3-D translation sigma (absolute) : {_fmt_stat(avg.sigma_t_abs_3d)} m\n"
-        f"Translation sigma (absolute)     : ({_fmt_stat(avg.sigma_t_abs[0])}, {_fmt_stat(avg.sigma_t_abs[1])}, {_fmt_stat(avg.sigma_t_abs[2])}) m\n"
-        f"3-D translation residual RMSE    : {_fmt_stat(avg.t_rmse)} m\n"
-        f"Rotation sigma (posterior)       : {_fmt_stat(avg.sigma_r)} deg"
+        f"\nFusion method                    : {avg.fusion_method}\n"
+        f"Weighted anchor RMS              : {_fmt_stat(avg.anchor_weighted_rms)} m\n"
+        f"Maximum anchor residual          : {_fmt_stat(avg.anchor_max_residual)} m\n"
+        f"Rotation consistency diagnostic  : {_fmt_stat(avg.sigma_r)} deg"
     )

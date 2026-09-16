@@ -34,6 +34,10 @@ class AveragingResult:
     cov_t_abs: np.ndarray     # (3, 3) translation covariance from absolute RMSE propagation (m²)
     cov_t: np.ndarray         # (3, 3) centred translation covariance           (m²)
     cov_r: np.ndarray         # (3, 3) local rotation-vector covariance         (rad²)
+    fusion_method: str        # anchor fit or pair-pose fallback
+    anchor_geometry_ratio: float  # second/first weighted anchor spread singular value
+    anchor_weighted_rms: float    # weighted RMS anchor residual (m)
+    anchor_max_residual: float    # maximum anchor residual norm (m)
 
 
 @dataclass
@@ -41,6 +45,14 @@ class PairLocalResidual:
     name: str
     translation: np.ndarray       # (3,) anchor-point residual in final world frame (m)
     rotation_vec_deg: np.ndarray  # (3,) relative rotation vector final <- single (deg)
+
+
+@dataclass
+class ConsensusRejection:
+    result: PairResult
+    anchor_residual: float
+    rotation_residual: float
+    reason: str
 
 
 def _weighted_quaternion_seed(rotations: list[Rotation], weights: np.ndarray) -> Rotation:
@@ -132,6 +144,28 @@ def _solve_translation_mean(
     return translation_mean, residuals
 
 
+def _solve_anchor_rigid_fit(
+    anchors_pc: np.ndarray,
+    anchors_global: np.ndarray,
+    weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Weighted Kabsch fit and a scale-free indicator of anchor non-collinearity."""
+    pc_centroid = np.average(anchors_pc, axis=0, weights=weights)
+    global_centroid = np.average(anchors_global, axis=0, weights=weights)
+    pc_centered = anchors_pc - pc_centroid
+    global_centered = anchors_global - global_centroid
+
+    cross_covariance = (pc_centered * weights[:, None]).T @ global_centered
+    u, singular_values, vt = np.linalg.svd(cross_covariance)
+    correction = np.eye(3)
+    correction[-1, -1] = np.sign(np.linalg.det(vt.T @ u.T))
+    rotation = vt.T @ correction @ u.T
+    translation = global_centroid - rotation @ pc_centroid
+    residuals = anchors_global - (anchors_pc @ rotation.T + translation)
+    geometry_ratio = float(singular_values[1] / singular_values[0]) if singular_values[0] > 0 else 0.0
+    return rotation, translation, residuals, geometry_ratio
+
+
 def centered_transform_from_global(T_global: np.ndarray, center: np.ndarray) -> np.ndarray:
     """Recover the centred-frame point-cloud->global transform from the global-frame one."""
     T_centered = np.eye(4)
@@ -170,6 +204,10 @@ def single_transform(result: PairResult, center: np.ndarray) -> AveragingResult:
         cov_t_abs=np.eye(3, dtype=np.float64) * rmse**2,
         cov_t=nan_mat.copy(),
         cov_r=nan_mat.copy(),
+        fusion_method="single GCPC",
+        anchor_geometry_ratio=float("nan"),
+        anchor_weighted_rms=0.0,
+        anchor_max_residual=0.0,
     )
 
 
@@ -207,38 +245,53 @@ def compute_pair_local_residuals(
     return diagnostics
 
 
-def average_transforms(results: list[PairResult], center: np.ndarray) -> AveragingResult:
-    """Weighted LS solution with rotation averaging and anchor-coupled translation.
+def average_transforms(
+    results: list[PairResult],
+    center: np.ndarray,
+    rmse_weight_floor: float = 0.02,
+    min_anchor_geometry_ratio: float = 1e-3,
+) -> AveragingResult:
+    """Fit a rigid pose to distributed anchors, with pair-pose averaging as fallback.
 
     When a single accepted GCPC is available, return its transform directly.
 
-    Rotation is solved first by weighted least squares on SO(3) using the
-    individual pair rotations. Translation is then solved in a coupled way at
-    the GCPC anchors using that final rotation:
-
-        t_i = anchor_global_i - R_avg @ anchor_pc_i
-
-    so small rotation differences are converted into translation observations at
-    the actual GCPC locations rather than at the arbitrary centred origin.
+    Three or more sufficiently non-collinear anchors determine rotation and
+    translation jointly by weighted Kabsch fitting. Sparse or degenerate anchor
+    layouts fall back to the independently registered pair rotations.
     """
     if len(results) == 1:
         return single_transform(results[0], center)
 
-    weights = np.array([1.0 / r.inlier_rmse**2 for r in results], dtype=np.float64)
+    sigmas = np.maximum(
+        np.array([r.inlier_rmse for r in results], dtype=np.float64),
+        rmse_weight_floor,
+    )
+    weights = 1.0 / sigmas**2
     weights_norm = weights / weights.sum()
 
     anchors_pc = np.array([r.anchor_pc for r in results], dtype=np.float64)
     anchors_global = np.array([r.anchor_global for r in results], dtype=np.float64)
     rotations = [Rotation.from_matrix(r.T_centered[:3, :3]) for r in results]
 
-    R_avg, r_residual_vecs = _solve_rotation_mean(rotations, weights)
-    R_avg_matrix = R_avg.as_matrix()
-    t_avg_c, t_residuals = _solve_translation_mean(
-        anchors_pc,
-        anchors_global,
-        R_avg_matrix,
-        weights,
-    )
+    pair_rotation_mean, r_residual_vecs = _solve_rotation_mean(rotations, weights)
+    if len(results) >= 3:
+        R_avg_matrix, t_avg_c, t_residuals, geometry_ratio = _solve_anchor_rigid_fit(
+            anchors_pc, anchors_global, weights
+        )
+    else:
+        geometry_ratio = 0.0
+
+    if len(results) < 3 or geometry_ratio < min_anchor_geometry_ratio:
+        R_avg_matrix = pair_rotation_mean.as_matrix()
+        t_avg_c, t_residuals = _solve_translation_mean(
+            anchors_pc, anchors_global, R_avg_matrix, weights
+        )
+        fusion_method = "pair-pose averaging fallback"
+    else:
+        fusion_method = "weighted anchor rigid fit"
+
+    R_avg = Rotation.from_matrix(R_avg_matrix)
+    r_residual_vecs = np.array([(R_avg.inv() * rot).as_rotvec() for rot in rotations])
 
     T_avg_c = np.eye(4)
     T_avg_c[:3, :3] = R_avg_matrix
@@ -248,7 +301,7 @@ def average_transforms(results: list[PairResult], center: np.ndarray) -> Averagi
     r_residuals = np.degrees(np.linalg.norm(r_residual_vecs, axis=1))
 
     cov_t_abs = _translation_covariance_from_absolute_sigmas(
-        np.array([r.inlier_rmse for r in results], dtype=np.float64)
+        sigmas
     )
     sigma_t_abs = np.sqrt(np.diag(cov_t_abs))
     sigma_t_abs_3d = float(np.sqrt(np.trace(cov_t_abs)))
@@ -262,6 +315,7 @@ def average_transforms(results: list[PairResult], center: np.ndarray) -> Averagi
     sigma_r = float(np.degrees(np.sqrt(np.trace(cov_r))))
 
     t_rmse = float(np.sqrt(np.average(np.sum(t_residuals**2, axis=1), weights=weights)))
+    anchor_norms = np.linalg.norm(t_residuals, axis=1)
 
     return AveragingResult(
         T_avg=T_avg,
@@ -278,4 +332,122 @@ def average_transforms(results: list[PairResult], center: np.ndarray) -> Averagi
         cov_t_abs=cov_t_abs,
         cov_t=cov_t,
         cov_r=cov_r,
+        fusion_method=fusion_method,
+        anchor_geometry_ratio=geometry_ratio,
+        anchor_weighted_rms=t_rmse,
+        anchor_max_residual=float(anchor_norms.max()),
     )
+
+
+def reject_consensus_outliers(
+    results: list[PairResult],
+    center: np.ndarray,
+    max_anchor_residual: float,
+    max_rotation_residual: float,
+    rmse_weight_floor: float = 0.02,
+) -> tuple[list[PairResult], list[ConsensusRejection], bool]:
+    """Select an unweighted pose consensus, then hard-check the fused inliers."""
+    if len(results) < 2:
+        return list(results), [], False
+
+    compatibility_sets: list[np.ndarray] = []
+    candidate_scores: list[float] = []
+    for candidate in results:
+        candidate_rotation = Rotation.from_matrix(candidate.T_centered[:3, :3])
+        translation_residuals: list[float] = []
+        rotation_residuals: list[float] = []
+        for observation in results:
+            predicted = (
+                observation.anchor_pc @ candidate.T_centered[:3, :3].T
+                + candidate.T_centered[:3, 3]
+            )
+            translation_residuals.append(float(np.linalg.norm(predicted - observation.anchor_global)))
+            rotation_residuals.append(
+                float(
+                    np.degrees(
+                        np.linalg.norm(
+                            (
+                                candidate_rotation.inv()
+                                * Rotation.from_matrix(observation.T_centered[:3, :3])
+                            ).as_rotvec()
+                        )
+                    )
+                )
+            )
+        translation_array = np.asarray(translation_residuals)
+        rotation_array = np.asarray(rotation_residuals)
+        compatible = (
+            (translation_array <= max_anchor_residual)
+            & (rotation_array <= max_rotation_residual)
+        )
+        compatibility_sets.append(compatible)
+        normalized = (
+            translation_array / max_anchor_residual
+            + rotation_array / max_rotation_residual
+        )
+        candidate_scores.append(float(normalized[compatible].sum()))
+
+    counts = np.array([np.count_nonzero(mask) for mask in compatibility_sets])
+    max_count = int(counts.max())
+    contenders = np.flatnonzero(counts == max_count)
+    best = int(min(contenders, key=lambda index: candidate_scores[index]))
+    ambiguous = len({tuple(compatibility_sets[index]) for index in contenders}) > 1
+    retained = [result for result, keep in zip(results, compatibility_sets[best]) if keep]
+    rejected: list[ConsensusRejection] = []
+
+    seed = results[best]
+    seed_rotation = Rotation.from_matrix(seed.T_centered[:3, :3])
+    for result, keep in zip(results, compatibility_sets[best]):
+        if keep:
+            continue
+        predicted = result.anchor_pc @ seed.T_centered[:3, :3].T + seed.T_centered[:3, 3]
+        translation_residual = float(np.linalg.norm(predicted - result.anchor_global))
+        rotation_residual = float(
+            np.degrees(
+                np.linalg.norm(
+                    (seed_rotation.inv() * Rotation.from_matrix(result.T_centered[:3, :3])).as_rotvec()
+                )
+            )
+        )
+        reasons: list[str] = []
+        if translation_residual > max_anchor_residual:
+            reasons.append(f"anchor residual > {max_anchor_residual:.3f} m")
+        if rotation_residual > max_rotation_residual:
+            reasons.append(f"rotation residual > {max_rotation_residual:.3f} deg")
+        rejected.append(
+            ConsensusRejection(result, translation_residual, rotation_residual, " and ".join(reasons))
+        )
+
+    while len(retained) > 2:
+        avg = average_transforms(retained, center, rmse_weight_floor=rmse_weight_floor)
+        residuals = compute_pair_local_residuals(retained, avg, center)
+        translation_norms = np.array(
+            [np.linalg.norm(item.translation) for item in residuals], dtype=np.float64
+        )
+        rotation_norms = np.array(
+            [np.linalg.norm(item.rotation_vec_deg) for item in residuals], dtype=np.float64
+        )
+        scores = np.maximum(
+            translation_norms / max_anchor_residual,
+            rotation_norms / max_rotation_residual,
+        )
+        worst = int(np.argmax(scores))
+        if scores[worst] <= 1.0:
+            break
+
+        reasons: list[str] = []
+        if translation_norms[worst] > max_anchor_residual:
+            reasons.append(f"anchor residual > {max_anchor_residual:.3f} m")
+        if rotation_norms[worst] > max_rotation_residual:
+            reasons.append(f"rotation residual > {max_rotation_residual:.3f} deg")
+        rejected.append(
+            ConsensusRejection(
+                result=retained[worst],
+                anchor_residual=float(translation_norms[worst]),
+                rotation_residual=float(rotation_norms[worst]),
+                reason=" and ".join(reasons),
+            )
+        )
+        retained.pop(worst)
+
+    return retained, rejected, ambiguous

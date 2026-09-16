@@ -35,6 +35,15 @@ class PairResult:
     inlier_rmse: float        # inlier RMSE  (m)
 
 
+@dataclass
+class FitMetrics:
+    """One-sided GCPC coverage and distance metrics for a fixed transform."""
+
+    name: str
+    fitness: float
+    inlier_rmse: float
+
+
 def _as_xyz_array(point_cloud: small_gicp.PointCloud) -> np.ndarray:
     """Return PointCloud coordinates as an (N, 3) float64 array."""
     return np.asarray(point_cloud.points(), dtype=np.float64)[:, :3]
@@ -183,6 +192,34 @@ def _compute_registration_metrics(
     fitness = inlier_count / reference_count
     inlier_rmse = float(np.sqrt(np.mean(sq_dists[inlier_mask])))
     return fitness, max(inlier_rmse, 1e-9)
+
+
+def evaluate_transform_against_gcpc(
+    gcpc_path: Path,
+    pc_reference: PreparedPointCloud,
+    transform: np.ndarray,
+    voxel_size: float,
+    inlier_max_distance: float,
+    center: np.ndarray,
+    num_threads: int = 1,
+) -> FitMetrics:
+    """Score a fixed centred TLS->global transform against one GCPC."""
+    gcpc_xyz = io.load_xyz(gcpc_path) - center
+    gcpc_target = preprocess(
+        gcpc_xyz,
+        voxel_size,
+        center=None,
+        num_threads=num_threads,
+    )
+    fitness, inlier_rmse = _compute_registration_metrics(
+        transform,
+        pc_reference,
+        gcpc_target,
+        inlier_max_distance,
+        num_threads,
+        reference="target",
+    )
+    return FitMetrics(gcpc_path.stem, fitness, inlier_rmse)
 
 
 def register_pair(

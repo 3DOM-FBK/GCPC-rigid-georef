@@ -3,6 +3,8 @@
 Georeference a survey-grade point cloud to a global coordinate system using a set of
 small GNSS-enabled **Ground Control Point Clouds (GCPCs)**.
 
+![GCPCs Georeferencing example](img_GCPCs.png)
+
 ## Concept
 
 Each GCPC is a small area captured with a GNSS-enabled scanner (global coordinates).
@@ -70,6 +72,7 @@ uv run gcpc-rigid-georef \
 | `--max-anchor-residual` | `0.20` | Hard GCPC pose-consensus cutoff at its anchor (m) |
 | `--max-rotation-residual` | `1.0` | Hard GCPC pose-consensus rotation cutoff (deg) |
 | `--save-georef-las` | off | Write `pc_georeferenced.las` to the output directory |
+| `--save-georef-las-opt` | off | Optimized write of `pc_georeferenced.las` to the output directory useful if limited memory |
 
 ## Outputs
 
